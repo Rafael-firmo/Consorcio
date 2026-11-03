@@ -1,177 +1,307 @@
-# Consórcio de caronas (VaiJunto, Problema 2)
+# VaiJunto Consórcio · Problema 2 (TEC502)
 
-Cada empresa do consórcio roda o seu próprio servidor. Os servidores se falam por
-API REST e confirmam itinerários que misturam empresas em duas fases (2PC), sem
-servidor central, sem coordenador fixo e sem banco compartilhado.
+Sistema distribuído de caronas compartilhadas entre três empresas. Cada empresa
+roda o seu próprio servidor, e os servidores se comunicam por API REST. Um
+itinerário pode misturar trechos de várias empresas, e a reserva é confirmada em
+todas elas ou em nenhuma, pelo protocolo de duas fases (2PC). Não há servidor
+central, coordenador fixo nem banco de dados compartilhado.
 
 A especificação da API e o diagrama de sequência estão em [docs/API.md](docs/API.md).
 
-## Requisitos
+---
 
-- **Docker** (jeito recomendado), ou
-- **Python 3.10+** e as bibliotecas do `requirements.txt` (Flask e requests):
+## Sumário
 
-```bash
-pip install -r requirements.txt
-```
+1. [Arquivos do projeto](#1-arquivos-do-projeto)
+2. [Requisitos](#2-requisitos)
+3. [Três empresas em um computador](#3-três-empresas-em-um-computador)
+4. [Uma empresa por computador](#4-uma-empresa-por-computador)
+5. [Clientes: motorista e passageiro](#5-clientes-motorista-e-passageiro)
+6. [Simulador de carga](#6-simulador-de-carga)
+7. [Derrubar e recuperar uma empresa](#7-derrubar-e-recuperar-uma-empresa)
+8. [Testes automatizados](#8-testes-automatizados)
+9. [Registro em disco](#9-registro-em-disco)
+10. [Variáveis de ambiente](#10-variáveis-de-ambiente)
+11. [Erros comuns](#11-erros-comuns)
 
-## 1. Três empresas numa máquina só
+---
 
-Com Docker:
+## 1. Arquivos do projeto
 
-```bash
-docker compose up --build
-```
+| Arquivo | O que faz |
+|---|---|
+| `servidor.py` | Servidor de uma empresa: rotas `/api` (clientes) e `/consorcio` (outras empresas) |
+| `armazem.py` | Estado da empresa (usuários, caronas, reservas), fila dos assentos e registro em disco |
+| `reservas.py` | Coordenação do 2PC, recuperação ao ligar, entregador de avisos e vigia de assentos retidos |
+| `outras_empresas.py` | Envio das requisições HTTP às outras empresas, com prazo e relógio |
+| `relogio.py` | Relógio lógico de Lamport |
+| `grafo.py` | Busca de itinerários (veio do Problema 1) |
+| `validacao.py` | Validação dos dados recebidos pela API |
+| `cliente.py` | Base dos clientes de terminal: conexão, login e menu |
+| `motorista.py` · `passageiro.py` | Clientes de terminal |
+| `simulador.py` | Passageiros automáticos para gerar carga |
+| `testes.py` | 9 testes automatizados com carga e quedas |
+| `Dockerfile` · `docker-compose.yml` | Imagem do sistema e as três empresas em uma máquina |
+| `docs/API.md` | Especificação da API e diagrama de sequência |
 
-As empresas ficam em `http://localhost:5001` (vaijunto), `:5002` (empresab) e
-`:5003` (empresac). Os dados de cada uma ficam na pasta `dados/`.
+---
 
-Sem Docker, em três terminais (Linux e macOS):
+## 2. Requisitos
 
-```bash
-EMPRESA=vaijunto PORTA=5001 PARES=empresab=http://127.0.0.1:5002,empresac=http://127.0.0.1:5003 python servidor.py
-EMPRESA=empresab PORTA=5002 PARES=vaijunto=http://127.0.0.1:5001,empresac=http://127.0.0.1:5003 python servidor.py
-EMPRESA=empresac PORTA=5003 PARES=vaijunto=http://127.0.0.1:5001,empresab=http://127.0.0.1:5002 python servidor.py
-```
+- **Docker** (recomendado). Todos os comandos abaixo usam Docker.
+- Opcional, para rodar sem Docker: **Python 3.10+** e `pip install -r requirements.txt`.
 
-No Windows (PowerShell), um terminal por empresa:
+No Linux, se o Docker pedir permissão, coloque `sudo` na frente dos comandos.
 
-```powershell
-$env:EMPRESA="vaijunto"; $env:PORTA="5001"; $env:PARES="empresab=http://127.0.0.1:5002,empresac=http://127.0.0.1:5003"; python servidor.py
-```
-
-(troque os valores nas outras duas, como nas linhas acima).
-
-## 2. Uma empresa por computador (laboratório)
-
-Cada empresa roda em um contêiner, em um computador diferente.
-
-**Antes de começar**, nos três computadores:
-
-1. Descubra o IP de cada um (`hostname -I` no Linux, `ipconfig` no Windows) e anote.
-2. Libere a **porta 5001** no firewall de cada um.
-3. Copie esta pasta para os três e construa a imagem:
+Construa a imagem uma vez, dentro da pasta do projeto, em cada computador que for usar:
 
 ```bash
 docker build -t consorcio .
 ```
 
-**Computador da vaijunto** (troque `IP_B` e `IP_C` pelos IPs reais):
+---
+
+## 3. Três empresas em um computador
 
 ```bash
-docker run --name vaijunto -p 5001:5001 -v vaijunto_dados:/dados \
-  -e EMPRESA=vaijunto \
-  -e PARES=empresab=http://IP_B:5001,empresac=http://IP_C:5001 \
-  consorcio
+docker compose up --build
 ```
 
-**Computador da empresab:**
+| Empresa | Endereço |
+|---|---|
+| vaijunto | `http://127.0.0.1:5001` |
+| empresab | `http://127.0.0.1:5002` |
+| empresac | `http://127.0.0.1:5003` |
+
+Para desligar: `Ctrl + C` e depois `docker compose down`.
+
+<details>
+<summary>Sem Docker (três terminais)</summary>
+
+Linux:
 
 ```bash
-docker run --name empresab -p 5001:5001 -v empresab_dados:/dados \
-  -e EMPRESA=empresab \
-  -e PARES=vaijunto=http://IP_VAIJUNTO:5001,empresac=http://IP_C:5001 \
-  consorcio
+EMPRESA=vaijunto PORTA=5001 PARES=empresab=http://127.0.0.1:5002,empresac=http://127.0.0.1:5003 python3 servidor.py
+EMPRESA=empresab PORTA=5002 PARES=vaijunto=http://127.0.0.1:5001,empresac=http://127.0.0.1:5003 python3 servidor.py
+EMPRESA=empresac PORTA=5003 PARES=vaijunto=http://127.0.0.1:5001,empresab=http://127.0.0.1:5002 python3 servidor.py
 ```
 
-**Computador da empresac:**
+Windows (PowerShell), exemplo da vaijunto:
+
+```powershell
+$env:EMPRESA="vaijunto"; $env:PORTA="5001"; $env:PARES="empresab=http://127.0.0.1:5002,empresac=http://127.0.0.1:5003"; python servidor.py
+```
+
+</details>
+
+---
+
+## 4. Uma empresa por computador
+
+Cada computador roda uma empresa em um contêiner.
+
+**Passo 1. Em cada computador**, entre na pasta do projeto, construa a imagem e anote o IP:
 
 ```bash
-docker run --name empresac -p 5001:5001 -v empresac_dados:/dados \
-  -e EMPRESA=empresac \
-  -e PARES=vaijunto=http://IP_VAIJUNTO:5001,empresab=http://IP_B:5001 \
-  consorcio
+docker build -t consorcio .
+hostname -I
 ```
 
-O volume (`-v ..._dados:/dados`) guarda o registro da empresa. Com ele, os dados
-voltam mesmo se o contêiner for apagado e criado de novo.
+O IP é o primeiro número mostrado (os endereços `172.17...`, `172.18...` e
+`172.19...` são redes internas do Docker).
 
-Para conferir a rede, a partir de qualquer computador:
+**Passo 2. Ligue a empresa de cada computador.** Troque `IP_VAIJUNTO`, `IP_B` e
+`IP_C` pelos IPs anotados. Em cada um, `PARES` lista as **outras duas** empresas.
+
+Computador da **vaijunto**:
 
 ```bash
-curl http://IP_DA_EMPRESA:5001/consorcio/auditoria
+docker run --name vaijunto -p 5001:5001 -v "$(pwd)/dados/vaijunto:/dados" -e EMPRESA=vaijunto -e PARES=empresab=http://IP_B:5001,empresac=http://IP_C:5001 consorcio
 ```
 
-Se não responder, o problema é de rede (IP errado ou firewall), não do sistema.
-
-### Derrubar e recuperar uma empresa (durante a apresentação)
+Computador da **empresab**:
 
 ```bash
-docker kill empresab      # queda abrupta, sem aviso
-docker start empresab     # volta e relê o próprio registro
+docker run --name empresab -p 5001:5001 -v "$(pwd)/dados/empresab:/dados" -e EMPRESA=empresab -e PARES=vaijunto=http://IP_VAIJUNTO:5001,empresac=http://IP_C:5001 consorcio
 ```
 
-`docker stop` e `docker rm` também funcionam; o volume mantém os dados.
-
-## 3. Clientes (motorista e passageiro)
-
-Cada cliente fala só com a própria empresa. Troque a URL para escolher a empresa:
+Computador da **empresac**:
 
 ```bash
-EMPRESA_URL=http://IP_VAIJUNTO:5001 python motorista.py
-EMPRESA_URL=http://IP_VAIJUNTO:5001 python passageiro.py
+docker run --name empresac -p 5001:5001 -v "$(pwd)/dados/empresac:/dados" -e EMPRESA=empresac -e PARES=vaijunto=http://IP_VAIJUNTO:5001,empresab=http://IP_B:5001 consorcio
 ```
 
-No PowerShell: `$env:EMPRESA_URL="http://IP_VAIJUNTO:5001"; python passageiro.py`.
+Ao ligar, a empresa mostra quem ela conhece. Confira:
 
-Com Docker (o `-it` é obrigatório para o menu receber o teclado):
+```
+empresa empresab na porta 5001, outras: ['vaijunto', 'empresac']
+```
+
+**Passo 3. Confira a rede** a partir de qualquer computador:
 
 ```bash
-docker run -it --rm -e EMPRESA_URL=http://IP_VAIJUNTO:5001 consorcio python motorista.py
-docker run -it --rm -e EMPRESA_URL=http://IP_VAIJUNTO:5001 consorcio python passageiro.py
+curl http://IP_B:5001/consorcio/auditoria
 ```
 
-O primeiro login de um nome cadastra o usuário.
+Se não responder, o problema é de rede (IP errado ou firewall). No Linux, libere a
+porta com `sudo ufw allow 5001`.
 
-## 4. Simulador de passageiros (carga)
+---
+
+## 5. Clientes: motorista e passageiro
+
+Cada cliente fala apenas com a própria empresa. O primeiro login com um nome
+novo cadastra o usuário.
+
+**No mesmo computador da empresa** (funciona em qualquer um dos dois modos):
 
 ```bash
-python simulador.py --empresas http://IP_VAIJUNTO:5001,http://IP_B:5001,http://IP_C:5001 \
-  --semear 5000 --passageiros 30 --duracao 20
+docker run -it --rm --network host -e EMPRESA_URL=http://127.0.0.1:5001 consorcio python motorista.py
+docker run -it --rm --network host -e EMPRESA_URL=http://127.0.0.1:5001 consorcio python passageiro.py
 ```
 
-`--semear N` publica caronas de exemplo com N assentos antes de começar
-(Salvador → Feira de Santana, Feira de Santana → Vitória da Conquista,
-Vitória da Conquista → Montes Claros). Ao final mostra quantas reservas deram
-certo, quantas foram recusadas e o tempo de uma reserva.
+No modo de um computador só, a porta escolhe a empresa: `5001` vaijunto,
+`5002` empresab, `5003` empresac.
 
-## 5. Testes automatizados
-
-Sobem três empresas sozinhos (processos locais, portas 5900 em diante), geram
-carga, derrubam empresas no meio das operações e conferem ao final que nenhum
-assento foi vendido duas vezes, nenhuma reserva ficou pela metade e nenhum
-assento ficou bloqueado:
+**De outro computador**, use o IP da empresa:
 
 ```bash
-python testes.py
+docker run -it --rm -e EMPRESA_URL=http://IP_B:5001 consorcio python motorista.py
 ```
 
-Ou em contêiner:
+O endereço leva **um** `http://` só, e o `-it` é obrigatório para o menu
+receber o teclado. Não use as setas do teclado no login.
+
+---
+
+## 6. Simulador de carga
+
+Vários passageiros automáticos, cada um em uma thread, buscando e reservando
+sem parar nas três empresas. É um cliente: só fala com as empresas pelo `/api`.
+
+Uma empresa por computador:
+
+```bash
+docker run --rm consorcio python simulador.py --empresas http://IP_VAIJUNTO:5001,http://IP_B:5001,http://IP_C:5001 --semear 5000 --passageiros 30 --duracao 120
+```
+
+Três empresas em um computador:
+
+```bash
+docker run --rm --network host consorcio python simulador.py --empresas http://127.0.0.1:5001,http://127.0.0.1:5002,http://127.0.0.1:5003 --semear 5000 --passageiros 30 --duracao 120
+```
+
+| Opção | Significado |
+|---|---|
+| `--empresas` | URLs das empresas, separadas por vírgula |
+| `--semear N` | Publica antes caronas encadeadas com N assentos: Salvador → Feira de Santana → Vitória da Conquista → Montes Claros |
+| `--passageiros` | Quantos passageiros simultâneos (padrão 20) |
+| `--duracao` | Segundos de carga (padrão 15) |
+
+Ao final, mostra quantas reservas deram certo, quantas foram recusadas e o tempo
+médio de uma reserva.
+
+---
+
+## 7. Derrubar e recuperar uma empresa
+
+No computador da empresa, com o simulador rodando:
+
+```bash
+docker kill empresab
+```
+
+`docker kill` é uma queda abrupta, sem aviso. As outras empresas continuam
+operando; só os trechos da empresa fora do ar ficam indisponíveis.
+
+Para religar:
+
+```bash
+docker start -a empresab
+```
+
+Ao subir, a empresa relê o seu registro, dá ABORT nas reservas que coordenava e
+que ficaram sem decisão, retoma os avisos pendentes e volta a atender.
+
+No modo de um computador só, o compose dá aos contêineres nomes como
+`<pasta>-empresab-1`, em que `<pasta>` é o nome da pasta do projeto. Confira o
+nome exato com `docker ps`.
+
+---
+
+## 8. Testes automatizados
 
 ```bash
 docker run --rm consorcio python testes.py
 ```
 
-## Variáveis de ambiente
+Os testes sobem três empresas sozinhos dentro do contêiner (portas 5900 em
+diante), por isso funcionam em qualquer computador, sem depender das empresas
+já ligadas.
+
+| Grupo | Testes |
+|---|---|
+| Funcionamento normal | Reserva entre três empresas · passageiro cancela · motorista cancela a carona |
+| Disputa | Vários passageiros, em várias empresas, pelo último assento: só um consegue |
+| Quedas | Coordenadora cai antes da decisão · coordenadora cai depois da decisão · carga com queda de participante · carga com queda da coordenadora · cancelamento com a coordenadora fora do ar |
+
+Ao final de cada teste, a auditoria das três empresas confere que nenhum assento
+foi vendido duas vezes, nenhuma reserva ficou confirmada em uma empresa e
+abortada em outra, e nenhum assento ficou retido.
+
+---
+
+## 9. Registro em disco
+
+Cada empresa grava tudo o que acontece em `registro.jsonl`, uma linha por evento,
+antes de responder. É esse arquivo que ela relê ao voltar de uma queda.
+
+| Como a empresa foi ligada | Onde fica o registro |
+|---|---|
+| `docker run` com `-v "$(pwd)/dados/<empresa>:/dados"` | `dados/<empresa>/registro.jsonl` na pasta do projeto |
+| `docker compose up` | `dados/<empresa>/registro.jsonl` na pasta do projeto |
+| Sem Docker | `dados/<empresa>/registro.jsonl` na pasta do projeto |
+
+O arquivo só aparece depois do primeiro evento daquela empresa (login, carona
+publicada ou reserva). Para acompanhar ao vivo:
+
+```bash
+tail -f dados/empresab/registro.jsonl
+```
+
+Para começar do zero, desligue a empresa e apague a pasta `dados/<empresa>`.
+
+---
+
+## 10. Variáveis de ambiente
 
 | Variável | Padrão | Para que serve |
 |---|---|---|
-| `EMPRESA` | `vaijunto` | nome desta empresa |
-| `PORTA` | `5001` | porta do servidor |
-| `PARES` | (vazio) | as outras empresas: `nome=http://ip:porta,nome=http://ip:porta` |
-| `DADOS` | `./dados/<empresa>` (`/dados` no Docker) | pasta do registro em disco |
-| `EMPRESA_URL` | `http://127.0.0.1:5001` | empresa a que o cliente se conecta |
-| `PRAZO_RETENCAO` | `8` | segundos até uma empresa perguntar à coordenadora sobre um assento segurado |
-| `ESPERA_MAX` | `2` | segundos de espera na fila de um trecho disputado |
-| `PERMITIR_INJECAO` | (desligado) | `1` deixa os testes derrubarem o servidor de propósito |
+| `EMPRESA` | `vaijunto` | Nome desta empresa |
+| `PORTA` | `5001` | Porta do servidor |
+| `PARES` | (vazio) | As outras empresas: `nome=http://ip:porta,nome=http://ip:porta` |
+| `DADOS` | `./dados/<empresa>` (`/dados` no Docker) | Pasta do registro em disco |
+| `EMPRESA_URL` | `http://127.0.0.1:5001` | Empresa a que o cliente se conecta |
+| `PRAZO_RETENCAO` | `8` | Segundos sem notícia até a empresa perguntar à coordenadora sobre um assento segurado |
+| `ESPERA_MAX` | `2` | Segundos máximos de espera na fila de um trecho disputado |
+| `PERMITIR_INJECAO` | (desligado) | `1` permite que os testes derrubem o servidor de propósito |
 
-## Erros comuns
+---
 
-| Erro | Solução |
+## 11. Erros comuns
+
+| Erro | Causa e solução |
 |---|---|
-| `nao consegui falar com http://...` | Empresa fora do ar, IP errado ou firewall bloqueando a porta |
-| A busca mostra `empresas_fora_do_ar` | A outra empresa não respondeu no prazo; a busca segue sem ela |
+| `nao consegui falar com http://...` | Empresa fora do ar, IP errado ou firewall. Confira com `curl .../consorcio/auditoria` |
+| `nao consegui falar com http://http://...` | `http://` repetido no endereço; deixe um só |
+| `nao consegui falar com http://127.0.0.1:...` em contêiner | Faltou `--network host` no `docker run` do cliente |
+| `outras:` mostra nome errado ao ligar | Erro de digitação em `PARES`; apague o contêiner e rode o comando de novo |
+| Duas empresas com o mesmo nome | Cada computador deve rodar uma empresa diferente; confira o `--name` e o `EMPRESA` |
+| `name already in use` | Já existe um contêiner com esse nome: `docker rm -f <nome>` |
+| `port is already allocated` | Algo já usa a porta (por exemplo, o compose): `docker compose down` ou `docker rm -f <nome>` |
+| `^[[200~` antes do comando colado | Lixo da colagem; apague esses caracteres antes de apertar Enter |
+| O menu do cliente não recebe o teclado | Faltou `-it` no `docker run` |
 | `401` / "o servidor reiniciou, entre de novo" | O login fica só na memória; entre outra vez |
-| O menu do cliente não recebe o teclado no Docker | Falta `-it` no `docker run` |
-| `address already in use` | Já há algo na porta; mude `PORTA` |
-| `docker: command not found` / permissão negada | No Linux, use `sudo` na frente do comando |
+| A busca mostra `empresas_fora_do_ar` | Uma empresa não respondeu no prazo; a busca segue sem ela |
+| `python: comando não encontrado` | Use os comandos com Docker, ou `python3` |
+| `docker: permissão negada` | No Linux, use `sudo` na frente do comando |
