@@ -1,0 +1,27 @@
+# As tres empresas numa maquina so, para desenvolver e testar.
+# No laboratorio, cada empresa roda em um computador (ver README).
+
+services:
+  vaijunto:
+    build: .
+    environment:
+      EMPRESA: vaijunto
+      PARES: empresab=http://empresab:5001,empresac=http://empresac:5001
+    ports: ["5001:5001"]
+    volumes: ["./dados/vaijunto:/dados"]
+
+  empresab:
+    build: .
+    environment:
+      EMPRESA: empresab
+      PARES: vaijunto=http://vaijunto:5001,empresac=http://empresac:5001
+    ports: ["5002:5001"]
+    volumes: ["./dados/empresab:/dados"]
+
+  empresac:
+    build: .
+    environment:
+      EMPRESA: empresac
+      PARES: vaijunto=http://vaijunto:5001,empresab=http://empresab:5001
+    ports: ["5003:5001"]
+    volumes: ["./dados/empresac:/dados"]
